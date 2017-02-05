@@ -19,6 +19,7 @@
 import urllib
 import os
 import sys
+import smbus
 import subprocess
 import json
 from datetime import datetime
@@ -31,11 +32,16 @@ PIN = 4
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(PIN, GPIO.IN)
 
+bus = smbus.SMBus(1)
+address_tmp = 0x48
+register_tmp = 0x00
+
+
 BASE_DIR = os.path.dirname(__file__)
 
 # ファイルからMS APIキーとKintone設定ファイルのの読み込み
 ms_api_key = yaml.load(open(os.path.join(BASE_DIR, 'conf/ms_api_key.yaml')).read())
-kintone_conf = yaml.load(open(os.path.join(BASE_DIR, 'conf/kintone_conf.yaml')).read())
+#kintone_conf = yaml.load(open(os.path.join(BASE_DIR, 'conf/kintone_conf.yaml')).read())
 
 # MS Face APIのヘッダ
 face_api_headers = {
@@ -56,7 +62,20 @@ face_api_params = urllib.parse.urlencode({
     'returnFaceLandmarks': 'false',
     'returnFaceAttributes': 'age,gender',
 })
+def read_tmp_sensor():
+    word_data =  bus.read_word_data(address_tmp, register_tmp)
+    data = (word_data & 0xff00)>>8 | (word_data & 0xff)<<8
+    data = data>>4 # 12ビットデータ
+    if data & 0x800 == 0:  # 温度が正の場合
+        temperature = data*0.0625
+    else: # 温度が負の場合、絶対値を取ってからマイナスをかける
+        temperature = ( (~data&0xfff) + 1)*-0.0625
+    return temperature
 
+# rest interface setting
+key = os.getenv("maker_key")
+event = os.getenv("maker_event_store_sensor")
+trigger_url = 'https://maker.ifttt.com/trigger/' + event + '/with/key/' + key
 def send_face_attr_to_kintone(face_results):
     """
     検出されたすべての顔データをKintoneにPOSTする
@@ -67,10 +86,13 @@ def send_face_attr_to_kintone(face_results):
         # 性別と年齢のみ取り出す
         gender = result['faceAttributes']['gender']
         age = result['faceAttributes']['age']
+        temp = read_tmp_sensor()
+
+        payload = {'value1':gender,'value2':age,'value3':temp}
+        r = requests.post(trigger_url, data=payload)
+        print( "success" if r.status_code == 200 else "fail")
 
         record = {"datetime": {'value': datetime.now().strftime('%Y-%m-%dT%H:%M:%S+09:00')}, "age": {'value': age}, "gender": {'value': gender}}
-        payload = {'app': kintone_conf['id'], 'record': record }
-
         # 1人分をKintoneへPOST
         response = requests.post('https://{}.cybozu.com/k/v1/record.json'.format(kintone_conf['domain']), data=json.dumps(payload), headers=kintone_api_headers)
 
@@ -79,6 +101,19 @@ def send_face_attr_to_kintone(face_results):
         else:
             print('Error!')
             print(response.raise_for_status())
+def send_ifttt(face_results):
+    # 顔の検出人数分だけループ
+    for result in face_results:
+        # 性別と年齢のみ取り出す
+        gender = result['faceAttributes']['gender']
+        age = result['faceAttributes']['age']
+        #temp = read_tmp_sensor()
+
+        payload = {'value1':gender,'value2':age,'value3':1}
+        r = requests.post(trigger_url, data=payload)
+        print( "success" if r.status_code == 200 else "fail")
+
+        #record = {"datetime": {'value': datetime.now().strftime('%Y-%m-%dT%H:%M:%S+09:00')}, "age": {'value': age}, "gender": {'value': gender}}
 
 def detect_faces(filename):
     """
@@ -121,6 +156,7 @@ try:
             # MS Face APIで顔検出
             print('Sending the image to MS face API...')
             results = detect_faces('cam.jpg')
+            send_ifttt(results)
             print('Done.')
 
             #if len(results) > 0:
